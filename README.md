@@ -1,5 +1,7 @@
 # S3 -> ELTC -> SQS
 
+## Note: This requires Node v4+ due to ES6 syntax
+
 ```
 processFile [file] <options>
 
