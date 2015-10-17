@@ -1,0 +1,268 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const path = require('path');
+const zlib = require('zlib');
+const util = require('util');
+const fs = require('fs');
+const AWS = require('aws-sdk');
+const S3 = AWS.S3;
+const ELTR = AWS.ElasticTranscoder;
+const SQS = AWS.SQS;
+const ProgressBar = require('progress');
+
+const argv = require('yargs')
+  // Usage description
+    .usage('$0 [file] <options>')
+  // File
+    .demand(1)
+  // Config
+    .alias('c', 'config')
+    .describe('c', 'Config JS File to use. This will ignore all other config args. If this is not provided, and there is no .config.js in your current working directory, all other options are required')
+  // S3 Key
+    .alias('k', 'key')
+    .describe('k', 'S3 API Key')
+  // S3 Secret
+    .alias('s', 'secret')
+    .describe('s', 'S3 API Secret')
+  // S3 Bucket
+    .alias('b', 'bucket')
+    .describe('b', 'S3 Bucket')
+  // S3 Region
+    .alias('r', 'region')
+    .describe('r', 'AWS Region')
+  // S3 File Key Prefix (Path)
+    .alias('p', 'prefix')
+    .describe('p', 'S3 File Key Prefix (Path)')
+  // S3 File Key (Path)
+    .alias('q', 'queue')
+    .describe('q', 'SQS Url')
+  // S3 File Key (Path)
+    .alias('i', 'pipeline')
+    .describe('i', 'The Elastic Transcoder pipeline ID')
+  // Get our args
+    .argv;
+
+let config;
+const defaultConfigPath = path.join(process.cwd(), '.config.js');
+
+if (argv.config) {
+  let cliConfigPath = path.join(process.cwd(), arv.config);
+  if (fs.statSync(cliConfigPath).isFile()) {
+    config = require(cliConfigPath);
+  } else {
+    console.log(`The config file you specified (${cliConfigPath}) does not exist`)
+    process.exit(1);
+  }
+}
+else if (fs.statSync(defaultConfigPath).isFile()) {
+  console.log('A default config file was found');
+  config = require(defaultConfigPath);
+}
+else {
+  config = {
+    accessKey: argv.key,
+    accessSecret: argv.secret,
+    region: argv.region,
+    bucket: argv.bucket,
+    prefixPath: argv.prefix,
+    queueUrl: argv.queue,
+    pipelineId: arv.pipeline
+  }
+}
+
+AWS.config.update({
+  accessKeyId: config.accessKey,
+  secretAccessKey: config.accessSecret,
+  region: config.region
+})
+
+const fileToUpload        = argv._[0];
+const localFullFilePath   = path.join(process.cwd(), fileToUpload);
+const localFileExtension  = path.extname(fileToUpload);
+const readStream          = fs.createReadStream(localFullFilePath);//.pipe(zlib.createGzip());
+const timeStamp           = Date.now();
+
+console.log(`Uploading to: ${generateInputS3Key()}`);
+
+const s3    = new S3();
+const eltr  = new ELTR();
+const sqs   = new SQS();
+
+let bar, queueInterval, jobId;
+
+s3.upload({
+    Bucket: config.bucket,
+    Key: generateInputS3Key(),
+    Body: readStream
+  })
+  .on('httpUploadProgress', evt => {
+    if (!bar) {
+      bar = new ProgressBar('Upload Progress: [:bar] :percent :current/:total ETA: :etas', {
+        total: evt.total,
+        width: 100,
+        complete: '=',
+        incomplete: ' '
+      });
+    }
+    bar.update(evt.loaded / evt.total);
+  })
+  .send((err, data) => {
+    if (err) {
+      console.log("An error occurred", err);
+      process.exit(1);
+    }
+
+    console.log("Uploaded the file at", decodeURIComponent(data.Location));
+    createElasticTranscoderJob();
+    startQueueListener();
+  })
+
+
+function createElasticTranscoderJob() {
+  const params = generateJobParams();
+  console.log("Submitting ElasticTranscoder job with following params:");
+  console.log(params);
+  eltr.createJob(params, function (error, data) {
+    if (error) {
+      console.log('Failed to send new video to ElasticTranscoder');
+      console.log(error);
+      process.exit(1);
+    } else {
+      // console.log("ElasticTranscoder job submitted");
+      // console.log(data);
+      jobId = data.Job.Id;
+    }
+  });
+}
+
+function startQueueListener() {
+  queueInterval = setInterval(checkForMessages, 3500);
+}
+
+function checkForMessages() {
+  sqs.receiveMessage({
+    QueueUrl: config.queueUrl,
+    MaxNumberOfMessages: 1, // how many messages do we wanna retrieve?
+    VisibilityTimeout: 60, // seconds - how long we want a lock on this job
+    WaitTimeSeconds: 3 // seconds - how long should we wait for a message?
+  }, function(err, data) {
+    if (data.Messages) {
+      // Get the first message (should be the only one since we said to only get one above)
+      const queueItem = data.Messages[0];
+      const body      = JSON.parse(queueItem.Body);
+      const message   = JSON.parse(body.Message);
+
+      if (jobId === message.jobId) {
+        console.log(body.Subject);
+
+        switch (message.state) {
+
+          case 'COMPLETED':
+            clearInterval(queueInterval);
+            console.log(`Your output files are available in s3://${config.bucket}/${message.outputKeyPrefix}`);
+            removeFromQueue(queueItem, exit(0));
+            break;
+
+          case 'ERROR':
+            console.log('There was an error processing your job');
+            console.log(message);
+            removeFromQueue(queueItem, exit(1));
+            break;
+
+          case 'CANCELED':
+            console.log('You job was canceled');
+            console.log(message);
+            removeFromQueue(queueItem, exit(1));
+            break;
+
+          default:
+            removeFromQueue(queueItem);
+
+        }
+
+        function exit(status) {
+          return function () {
+            process.exit(status);
+          }
+        }
+
+      } else {
+        // console.log('Message from irrelavant job received...moving on');
+      }
+    } else {
+      // console.log('No messages');
+    }
+ });
+}
+
+function removeFromQueue(queueItem, cb) {
+  sqs.deleteMessage({
+      QueueUrl: config.queueUrl,
+      ReceiptHandle: queueItem.ReceiptHandle
+   }, function(err, data) {
+      if (err) {
+        console.log(err);
+        process.exit(1);
+      } else {
+        // console.log('Message removed from queue');
+        // console.log(data);
+        if (cb) cb()
+      }
+   });
+}
+
+function generateInputS3Key() {
+  return `${config.prefixPath}/${timeStamp}/input/${timeStamp}${localFileExtension.toLowerCase()}`;
+}
+
+function generateElasticTranscoderOutputPrefix() {
+  return `${config.prefixPath}/${timeStamp}/output/`;
+}
+
+function generateJobParams() {
+  return {
+    Input: {
+      Key: generateInputS3Key(),
+      FrameRate: 'auto',
+      Resolution: 'auto',
+      AspectRatio: 'auto',
+      Interlaced: 'auto',
+      Container: 'auto'
+    },
+    PipelineId: config.pipelineId, /* required */
+    OutputKeyPrefix: generateElasticTranscoderOutputPrefix(),
+    Outputs: [
+      {
+        "PresetId": "1351620000001-200035",
+        "SegmentDuration": "10.0",
+        "Key": `${timeStamp}_1m`,
+      },{
+        "PresetId": "1351620000001-200045",
+        "SegmentDuration": "10.0",
+        "Key": `${timeStamp}_600k`,
+      },{
+        "PresetId": "1351620000001-200055",
+        "SegmentDuration": "10.0",
+        "Key": `${timeStamp}_400k`,
+      },{
+        "PresetId": "1351620000001-200060",
+        "SegmentDuration": "10.0",
+        "Key": `${timeStamp}_160_audio`,
+      }
+    ],
+    Playlists: [
+      {
+        Name: "index",
+        Format: "HLSv4",
+        OutputKeys: [
+          `${timeStamp}_1m`,
+          `${timeStamp}_600k`,
+          `${timeStamp}_400k`,
+          `${timeStamp}_160_audio`
+        ],
+      }
+    ]
+  }
+}
