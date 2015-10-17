@@ -41,6 +41,8 @@ const argv = require('yargs')
   // S3 File Key (Path)
     .alias('i', 'pipeline')
     .describe('i', 'The Elastic Transcoder pipeline ID')
+  // Example
+    .example('$0 ../../../Downloads/video.mov', 'Upload and process video.mov\n(requires a .config.js file)')
   // Get our args
     .argv;
 
