@@ -16,7 +16,19 @@ Options:
   -p, --prefix    S3 File Key Prefix (Path)
   -q, --queue     SQS Url
   -i, --pipeline  The Elastic Transcoder pipeline ID
+
+Examples:
+  ./processFile ../../../Downloads/video.mov  Upload and process video.mov
+                                            (requires a .config.js file)
+
+
 ```
+
+### Setup
+
+Requires Node 4+
+
+Get the Deps: `npm install`
 
 This simple example script shows how to move a file from disk up to S3, trigger an Elastic Transcoder job, and wait for the job to be complete by listening to an SQS queue.
 
